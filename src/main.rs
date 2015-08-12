@@ -1,12 +1,16 @@
 extern crate ansi_term;
 extern crate clap;
 extern crate fern;
+extern crate itertools;
 extern crate libc;
 #[macro_use] extern crate log;
 extern crate mmap;
 extern crate time;
 
+use std::cmp;
+
 use clap::{Arg, App};
+use itertools::Itertools;
 
 mod logger;
 mod mm;
@@ -34,8 +38,43 @@ impl FormatOption {
 }
 
 
+#[derive(Debug, Clone, Copy)]
+enum SortOption {
+    /// Sort by start address
+    Address,
+
+    /// Sort by length of the string.
+    Length,
+
+    /// Sort by likelyhood that the string is English text.
+    English,
+}
+
+
+impl SortOption {
+    fn from_str(s: &str) -> SortOption {
+        match s {
+            ""        => SortOption::Address,
+            "address" => SortOption::Address,
+            "length"  => SortOption::Length,
+            "english" => SortOption::English,
+            _         => unreachable!(),
+        }
+    }
+}
+
+
+#[derive(Debug, Clone, Copy)]
+enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+
 fn main() {
     let format_choices = ["", "d", "o", "x"];
+    let sort_choices = ["", "address", "length", "english"];
+
     let matches = App::new("lstrings")
         .version("0.0.1")
         .author("Andrew Dunham <andrew@du.nham.ca>")
@@ -53,6 +92,14 @@ fn main() {
              .takes_value(true)
              .possible_values(&format_choices)
              .help("If given, specify the output format for each string"))
+        .arg(Arg::with_name("sort")
+             .short("s")
+             .takes_value(true)
+             .possible_values(&sort_choices)
+             .help("Specify how to sort the found strings"))
+        .arg(Arg::with_name("reverse")
+             .short("r")
+             .help("Reverse the sort order (i.e. descending order)"))
         .arg(Arg::with_name("input")
              .help("Sets the input file(s) to search")
              .required(true)
@@ -73,11 +120,17 @@ fn main() {
         }
     };
     let format = FormatOption::from_str(matches.value_of("format").unwrap_or(""));
+    let sort = SortOption::from_str(matches.value_of("sort").unwrap_or("address"));
+    let direction = if matches.is_present("reverse") {
+        SortDirection::Descending
+    } else {
+        SortDirection::Ascending
+    };
     let input_paths = matches.values_of("input").unwrap();
 
     for path in input_paths {
         info!("Searching file: {}", path);
-        search_file(path, number, format);
+        search_file(path, number, format, sort, direction);
     }
 }
 
@@ -96,6 +149,10 @@ impl FoundString {
         end
     }
 
+    fn len(&self) -> usize {
+        self.end() - self.start()
+    }
+
     fn slice<'a>(&self, arr: &'a [u8]) -> &'a [u8] {
         let FoundString(start, end) = *self;
         &arr[start..end]
@@ -110,7 +167,7 @@ impl FoundString {
 }
 
 // Search the given input file for all strings and print them.
-fn search_file<P>(path: P, min_len: usize, format: FormatOption)
+fn search_file<P>(path: P, min_len: usize, format: FormatOption, sort: SortOption, dir: SortDirection)
 where P: std::convert::AsRef<std::path::Path>
 {
     let path = path.as_ref();
@@ -142,8 +199,22 @@ where P: std::convert::AsRef<std::path::Path>
             start = None;
         }
 
+        // Sort the results.
+        let sort_func: fn(&FoundString, &FoundString) -> cmp::Ordering = match (sort, dir) {
+            (SortOption::Address, SortDirection::Ascending)  => sort_address_asc,
+            (SortOption::Address, SortDirection::Descending) => sort_address_desc,
+            (SortOption::Length, SortDirection::Ascending)   => sort_length_asc,
+            (SortOption::Length, SortDirection::Descending)  => sort_length_desc,
+            (SortOption::English, SortDirection::Ascending)  => panic!("unsupported"),
+            (SortOption::English, SortDirection::Descending) => panic!("unsupported"),
+        };
+
+        let sorted_results = results
+            .into_iter()
+            .sort_by(sort_func);
+
         // Print all results.
-        for res in results {
+        for res in sorted_results {
             let prefix = match format {
                 FormatOption::Decimal     => format!("{} ", res.start()),
                 FormatOption::Octal       => format!("{:o} ", res.start()),
@@ -159,4 +230,24 @@ where P: std::convert::AsRef<std::path::Path>
 #[inline(always)]
 fn is_printable(ch: u8) -> bool {
     ch > 0x1F && ch < 0x7F
+}
+
+#[inline(always)]
+fn sort_address_asc(a: &FoundString, b: &FoundString) -> cmp::Ordering {
+    Ord::cmp(&a.start(), &b.start())
+}
+
+#[inline(always)]
+fn sort_address_desc(a: &FoundString, b: &FoundString) -> cmp::Ordering {
+    Ord::cmp(&b.start(), &a.start())
+}
+
+#[inline(always)]
+fn sort_length_asc(a: &FoundString, b: &FoundString) -> cmp::Ordering {
+    Ord::cmp(&a.len(), &b.len())
+}
+
+#[inline(always)]
+fn sort_length_desc(a: &FoundString, b: &FoundString) -> cmp::Ordering {
+    Ord::cmp(&b.len(), &a.len())
 }
