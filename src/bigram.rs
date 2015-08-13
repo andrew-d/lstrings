@@ -34,9 +34,14 @@ impl BigramMap {
             return
         }
 
-        let b = s.as_bytes();
+        // Skip all spaces in the string - Wikipedia recommends this as a way
+        // to get better accuracy?
+        let b = s.as_bytes()
+            .into_iter()
+            .filter(|&b| *b != b' ')
+            .map(|b| *b)
+            .collect::<Vec<u8>>();
         for chunk in b.windows(2) {
-            // TODO: maybe skip spaces here?
             self.bump(chunk[0], chunk[1]);
         }
 
