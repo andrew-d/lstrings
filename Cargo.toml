@@ -5,11 +5,13 @@ authors = ["Andrew Dunham <andrew@du.nham.ca>"]
 
 [dependencies]
 ansi_term = "*"
+bincode = "*"
 clap = "*"
 fern = "0.3"
 itertools = "*"
 libc = "*"
 log = "0.3"
+rustc-serialize = "*"
 time = "0.1"
 
 [dependencies.mmap]

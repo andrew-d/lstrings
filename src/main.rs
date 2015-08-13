@@ -1,19 +1,23 @@
+#![feature(vec_resize)]
+
 extern crate ansi_term;
+extern crate bincode;
 extern crate clap;
 extern crate fern;
 extern crate itertools;
 extern crate libc;
 #[macro_use] extern crate log;
 extern crate mmap;
+extern crate rustc_serialize;
 extern crate time;
 
-use std::cmp;
-
+use bincode::rustc_serialize::decode;
 use clap::{Arg, App};
 use itertools::Itertools;
 
 mod logger;
 mod mm;
+mod bigram;
 
 
 #[derive(Debug, Clone, Copy)]
@@ -28,7 +32,7 @@ enum FormatOption {
 impl FormatOption {
     fn from_str(s: &str) -> FormatOption {
         match s {
-            ""  => FormatOption::NoFormat,
+            "n"  => FormatOption::NoFormat,
             "d" => FormatOption::Decimal,
             "o" => FormatOption::Octal,
             "x" => FormatOption::Hexadecimal,
@@ -54,7 +58,6 @@ enum SortOption {
 impl SortOption {
     fn from_str(s: &str) -> SortOption {
         match s {
-            ""        => SortOption::Address,
             "address" => SortOption::Address,
             "length"  => SortOption::Length,
             "english" => SortOption::English,
@@ -72,8 +75,8 @@ enum SortDirection {
 
 
 fn main() {
-    let format_choices = ["", "d", "o", "x"];
-    let sort_choices = ["", "address", "length", "english"];
+    let format_choices = ["n", "d", "o", "x"];
+    let sort_choices = ["address", "length", "english"];
 
     let matches = App::new("lstrings")
         .version("0.0.1")
@@ -119,7 +122,7 @@ fn main() {
             },
         }
     };
-    let format = FormatOption::from_str(matches.value_of("format").unwrap_or(""));
+    let format = FormatOption::from_str(matches.value_of("format").unwrap_or("n"));
     let sort = SortOption::from_str(matches.value_of("sort").unwrap_or("address"));
     let direction = if matches.is_present("reverse") {
         SortDirection::Descending
@@ -170,13 +173,16 @@ impl FoundString {
 fn search_file<P>(path: P, min_len: usize, format: FormatOption, sort: SortOption, dir: SortDirection)
 where P: std::convert::AsRef<std::path::Path>
 {
-    let path = path.as_ref();
+    use SortOption::*;
+    use SortDirection::*;
 
+    let path = path.as_ref();
     mm::with_file_mmap(path, |map| {
         let mut results = vec![];
 
         let mut start = None;
 
+        debug!("Searching for strings...");
         for (i, ch) in map.iter().enumerate() {
             if is_printable(*ch) {
                 if start.is_none() {
@@ -200,20 +206,17 @@ where P: std::convert::AsRef<std::path::Path>
         }
 
         // Sort the results.
-        let sort_func: fn(&FoundString, &FoundString) -> cmp::Ordering = match (sort, dir) {
-            (SortOption::Address, SortDirection::Ascending)  => sort_address_asc,
-            (SortOption::Address, SortDirection::Descending) => sort_address_desc,
-            (SortOption::Length, SortDirection::Ascending)   => sort_length_asc,
-            (SortOption::Length, SortDirection::Descending)  => sort_length_desc,
-            (SortOption::English, SortDirection::Ascending)  => panic!("unsupported"),
-            (SortOption::English, SortDirection::Descending) => panic!("unsupported"),
+        debug!("Sorting results...");
+        let sorted_results = match (sort, dir) {
+            (Address, Ascending)  => results.into_iter().sort_by(|a, b| Ord::cmp(&a.start(), &b.start())),
+            (Address, Descending) => results.into_iter().sort_by(|a, b| Ord::cmp(&b.start(), &a.start())),
+            (Length,  Ascending)  => results.into_iter().sort_by(|a, b| Ord::cmp(&a.len(), &b.len())),
+            (Length,  Descending) => results.into_iter().sort_by(|a, b| Ord::cmp(&b.len(), &a.len())),
+            (English, _)          => sort_by_bigrams(map, results, dir),
         };
 
-        let sorted_results = results
-            .into_iter()
-            .sort_by(sort_func);
-
         // Print all results.
+        debug!("Printing...");
         for res in sorted_results {
             let prefix = match format {
                 FormatOption::Decimal     => format!("{} ", res.start()),
@@ -232,22 +235,33 @@ fn is_printable(ch: u8) -> bool {
     ch > 0x1F && ch < 0x7F
 }
 
-#[inline(always)]
-fn sort_address_asc(a: &FoundString, b: &FoundString) -> cmp::Ordering {
-    Ord::cmp(&a.start(), &b.start())
+fn build_bigram_map() -> bigram::BigramMap {
+    let encoded_map = include_bytes!("english-bigram-map.bin");
+
+    let decoded: bigram::BigramMap = decode(&*encoded_map).unwrap();
+    decoded
 }
 
-#[inline(always)]
-fn sort_address_desc(a: &FoundString, b: &FoundString) -> cmp::Ordering {
-    Ord::cmp(&b.start(), &a.start())
-}
+fn sort_by_bigrams(map: &[u8], results: Vec<FoundString>, dir: SortDirection) -> Vec<FoundString> {
+    let bg = build_bigram_map();
 
-#[inline(always)]
-fn sort_length_asc(a: &FoundString, b: &FoundString) -> cmp::Ordering {
-    Ord::cmp(&a.len(), &b.len())
-}
+    let with_similarities = results
+        .into_iter()
+        .map(|r| {
+            let sim = bigram::BigramMap::from_str(r.as_str(map)).similarity(&bg);
 
-#[inline(always)]
-fn sort_length_desc(a: &FoundString, b: &FoundString) -> cmp::Ordering {
-    Ord::cmp(&b.len(), &a.len())
+            (sim, r)
+        })
+        .collect::<Vec<(f64, FoundString)>>();
+
+    let sorted = match dir {
+        SortDirection::Ascending => with_similarities
+            .into_iter()
+            .sort_by(|a, b| PartialOrd::partial_cmp(&a.0, &b.0).unwrap()),
+        SortDirection::Descending => with_similarities
+            .into_iter()
+            .sort_by(|a, b| PartialOrd::partial_cmp(&b.0, &a.0).unwrap()),
+    };
+
+    sorted.into_iter().map(|a| a.1).collect()
 }
