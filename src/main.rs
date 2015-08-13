@@ -74,6 +74,14 @@ enum SortDirection {
 }
 
 
+struct Options {
+    dir:    SortDirection,
+    format: FormatOption,
+    sort:   SortOption,
+    uniq:   bool,
+}
+
+
 fn main() {
     let format_choices = ["n", "d", "o", "x"];
     let sort_choices = ["address", "length", "english"];
@@ -103,6 +111,9 @@ fn main() {
         .arg(Arg::with_name("reverse")
              .short("r")
              .help("Reverse the sort order (i.e. descending order)"))
+        .arg(Arg::with_name("uniq")
+             .short("u")
+             .help("Remove duplicate strings"))
         .arg(Arg::with_name("input")
              .help("Sets the input file(s) to search")
              .required(true)
@@ -122,18 +133,30 @@ fn main() {
             },
         }
     };
-    let format = FormatOption::from_str(matches.value_of("format").unwrap_or("n"));
-    let sort = SortOption::from_str(matches.value_of("sort").unwrap_or("address"));
-    let direction = if matches.is_present("reverse") {
-        SortDirection::Descending
-    } else {
-        SortDirection::Ascending
+
+    let options = {
+        let format = FormatOption::from_str(matches.value_of("format").unwrap_or("n"));
+        let sort = SortOption::from_str(matches.value_of("sort").unwrap_or("address"));
+
+        let direction = if matches.is_present("reverse") {
+            SortDirection::Descending
+        } else {
+            SortDirection::Ascending
+        };
+
+        Options {
+            dir:    direction,
+            format: format,
+            sort:   sort,
+            uniq:   matches.is_present("uniq"),
+        }
     };
+
     let input_paths = matches.values_of("input").unwrap();
 
     for path in input_paths {
         info!("Searching file: {}", path);
-        search_file(path, number, format, sort, direction);
+        search_file(path, number, &options);
     }
 }
 
@@ -170,7 +193,7 @@ impl FoundString {
 }
 
 // Search the given input file for all strings and print them.
-fn search_file<P>(path: P, min_len: usize, format: FormatOption, sort: SortOption, dir: SortDirection)
+fn search_file<P>(path: P, min_len: usize, opts: &Options)
 where P: std::convert::AsRef<std::path::Path>
 {
     use SortOption::*;
@@ -207,18 +230,26 @@ where P: std::convert::AsRef<std::path::Path>
 
         // Sort the results.
         debug!("Sorting results...");
-        let sorted_results = match (sort, dir) {
+        let sorted_results = match (opts.sort, opts.dir) {
             (Address, Ascending)  => results.into_iter().sort_by(|a, b| Ord::cmp(&a.start(), &b.start())),
             (Address, Descending) => results.into_iter().sort_by(|a, b| Ord::cmp(&b.start(), &a.start())),
             (Length,  Ascending)  => results.into_iter().sort_by(|a, b| Ord::cmp(&a.len(), &b.len())),
             (Length,  Descending) => results.into_iter().sort_by(|a, b| Ord::cmp(&b.len(), &a.len())),
-            (English, _)          => sort_by_bigrams(map, results, dir),
+            (English, _)          => sort_by_bigrams(map, results, opts.dir),
+        };
+
+        // Optionally, deduplicate.
+        debug!("Deduplicating results...");
+        let deduped_results = if opts.uniq {
+            sorted_results.into_iter().unique_by(|e| e.as_str(map)).collect::<Vec<FoundString>>()
+        } else {
+            sorted_results
         };
 
         // Print all results.
         debug!("Printing...");
-        for res in sorted_results {
-            let prefix = match format {
+        for res in deduped_results {
+            let prefix = match opts.format {
                 FormatOption::Decimal     => format!("{} ", res.start()),
                 FormatOption::Octal       => format!("{:o} ", res.start()),
                 FormatOption::Hexadecimal => format!("{:x} ", res.start()),
@@ -245,8 +276,16 @@ fn build_bigram_map() -> bigram::BigramMap {
 fn sort_by_bigrams(map: &[u8], results: Vec<FoundString>, dir: SortDirection) -> Vec<FoundString> {
     let bg = build_bigram_map();
 
+    debug!("[bigram-sort] Calculating similarities...");
+    let mut count = 0;
     let with_similarities = results
         .into_iter()
+        .inspect(|_| {
+            if count % 5000 == 0 {
+                debug!("[bigram-sort] Processed element {}", count);
+            }
+            count += 1;
+        })
         .map(|r| {
             let sim = bigram::BigramMap::from_str(r.as_str(map)).similarity(&bg);
 
@@ -254,6 +293,7 @@ fn sort_by_bigrams(map: &[u8], results: Vec<FoundString>, dir: SortDirection) ->
         })
         .collect::<Vec<(f64, FoundString)>>();
 
+    debug!("[bigram-sort] Sorting...");
     let sorted = match dir {
         SortDirection::Ascending => with_similarities
             .into_iter()
@@ -263,5 +303,6 @@ fn sort_by_bigrams(map: &[u8], results: Vec<FoundString>, dir: SortDirection) ->
             .sort_by(|a, b| PartialOrd::partial_cmp(&b.0, &a.0).unwrap()),
     };
 
+    debug!("[bigram-sort] Mapping back...");
     sorted.into_iter().map(|a| a.1).collect()
 }
